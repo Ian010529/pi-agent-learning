@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Architecture Reference</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+  <p class="muted">Reference · source-first · updated 2026-10-06</p>
+  <h1>Pi Architecture — Quick Reference</h1>
+  <p>这是压缩参考，不替代 lesson。事实来源以当前 <a href="https://github.com/earendil-works/pi">Pi source</a> 为准。</p>
+
+  <h2>Core layers</h2>
+  <pre><code>packages/ai
+  model/provider boundary
+        ↓
+packages/agent
+  generic stateful agent
+  agent loop + tool execution + events + queues
+        ↓
+packages/coding-agent
+  coding harness
+  system prompt + coding tools + skills + sessions + compaction + extensions + MCP</code></pre>
+
+  <h2>Minimal execution</h2>
+  <pre><code>User message
+  ↓
+Agent.prompt(...)
+  ↓
+runAgentLoop(...)
+  ↓
+runLoop(...)
+  ↓
+streamAssistantResponse(...)
+  ↓
+AssistantMessage
+  ├─ text only
+  │    ↓
+  │  no natural continuation
+  │    ↓
+  │  follow-up check → end
+  │
+  └─ toolCall(s)
+       ↓
+     validate / execute
+       ↓
+     ToolResultMessage(s)
+       ↓
+     append to context
+       ↓
+     next provider request</code></pre>
+
+  <h2>Three distinctions to preserve</h2>
+  <table>
+    <tr><th>Do not collapse</th><th>Reason</th></tr>
+    <tr><td>LLM vs Agent</td><td>LLM produces an assistant message; Agent schedules requests, tools, context and lifecycle.</td></tr>
+    <tr><td>Agent core vs Coding harness</td><td><code>packages/agent</code> is generic; coding behavior is assembled above it.</td></tr>
+    <tr><td>Session history vs model context</td><td>Persistent history can remain while later model requests use a transformed/compacted context.</td></tr>
+  </table>
+
+  <h2>Primary files for Lesson 01</h2>
+  <ul>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/types.ts"><code>types.ts</code></a> — runtime contracts: messages, tools, context, events.</li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent.ts"><code>agent.ts</code></a> — stateful wrapper and message queues.</li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts"><code>agent-loop.ts</code></a> — scheduling, provider turn, tool execution, continuation.</li>
+  </ul>
+</body>
+</html>
