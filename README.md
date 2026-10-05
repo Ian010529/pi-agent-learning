@@ -43,8 +43,8 @@ If the subtitle and current source disagree, the current source wins and the dif
 - [NOTES.md](NOTES.md) — teaching preferences and working notes
 - [lessons/](lessons/) — short, self-contained lessons
 - [reference/](reference/) — compressed references for later lookup
-- [learning-records/](learning-records/) — evidence of what has actually been learned
 - [assets/](assets/) — reusable lesson assets
+- `learning-records/` — created lazily only after the first demonstrated learning gate is passed, following Matt's teach skill
 
 ## Current status
 
