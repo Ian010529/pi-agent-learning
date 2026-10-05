@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 01 — Minimal Agent Loop</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+  <p class="muted">Lesson 01 · Pi Agent · prepared 2026-10-06</p>
+  <h1>Minimal Agent Loop</h1>
+  <p><strong>本课只解决一个问题：</strong>去掉 TUI、skills、MCP、session 等外围后，Pi 的通用 Agent 到底怎样完成一次 “LLM → tool → result → LLM” 闭环？</p>
+
+  <div class="card">
+    <strong>完成标准</strong>
+    <p>不看资料，能从一次 <code>toolCall</code> 开始，准确说明 Pi 如何执行工具、产生 <code>ToolResultMessage</code>、为什么会再次请求模型，以及什么时候自然停止。</p>
+  </div>
+
+  <h2>1. Technical Foundation</h2>
+
+  <h3>1.1 LLM 不是 Agent</h3>
+  <p>这一课只保留最小区别：</p>
+  <pre><code>LLM:
+  transcript/context
+      ↓
+  assistant message
+
+Agent runtime:
+  准备 context
+      ↓
+  调 LLM
+      ↓
+  解析 assistant message
+      ↓
+  如有 tool call → 执行 → 写回 result
+      ↓
+  决定是否再发起 provider request</code></pre>
+  <p>因此 “LLM 会调用工具” 的准确含义不是模型自己执行函数，而是模型输出一个结构化的 <code>toolCall</code>；runtime 验证并执行。</p>
+
+  <h3>1.2 Turn 与 Loop</h3>
+  <p>Pi Agent Core README 把一个 turn 描述为：一个 assistant response 加上它产生的 tool executions/results。一次用户任务可以包含多个 turn。</p>
+  <pre><code>turn 1:
+  assistant(toolCall)
+  → tool result
+
+turn 2:
+  assistant(toolCall)
+  → tool result
+
+turn 3:
+  assistant(text)
+  → no automatic tool continuation</code></pre>
+
+  <h3>1.3 Context / Transcript</h3>
+  <p><code>AgentContext</code> 中最重要的两项是 <code>messages</code> 和可执行 <code>tools</code>。在 provider request 前，Agent messages 会经过 transform/convert，成为模型能理解的 transcript。</p>
+
+  <h3>1.4 Tool protocol</h3>
+  <p>在当前 <code>types.ts</code> 中，<code>AgentTool</code> 至少提供 schema/metadata 和 <code>execute(...)</code>；执行后返回 <code>AgentToolResult</code>。模型真正看到的是 result 的 model-facing <code>content</code>。</p>
+
+  <h3>1.5 Termination：先别把它理解成 “finished=true”</h3>
+  <p>正常情况下，loop 的自然 continuation 主要来自 tool result、steering/follow-up 或显式 continuation hook。没有这些 continuation 时 run 才结束。当前源码另外允许 <code>finishTurn</code> 明确返回 <code>{ action: "end" }</code> 或 <code>{ action: "continue" }</code>，所以不能把 Pi 简化成“模型回答 finished=true 就退出”。</p>
+
+  <h2>2. Primary Source Map</h2>
+  <p>先只读三份文件，不扩散：</p>
+  <ol>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/types.ts"><code>types.ts</code></a> — 先认出协议对象。</li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent.ts"><code>agent.ts</code></a> — 再看谁持有状态、消息和队列。</li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts"><code>agent-loop.ts</code></a> — 最后走执行链。</li>
+  </ol>
+  <p>辅助官方说明：<a href="https://github.com/earendil-works/pi/blob/main/packages/agent/README.md">Agent Core README</a> 与 <a href="https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/how-pi-works.md">How Pi Works</a>。</p>
+
+  <h2>3. Source Walkthrough</h2>
+
+  <h3>3.1 <code>types.ts</code>：先看 runtime 合同</h3>
+  <pre><code>AgentContext {
+  messages: AgentMessage[]
+  tools?: AgentTool[]
+}
+
+AgentTool.execute(...)
+  → Promise&lt;AgentToolResult&gt;
+
+AgentToolResult {
+  content
+  details
+  isError?
+  terminate?
+  ...
+}</code></pre>
+  <p>读这部分时只问两个问题：<strong>模型能请求什么？runtime 最后必须回灌什么？</strong></p>
+
+  <h3>3.2 <code>agent.ts</code>：Agent 是 stateful wrapper</h3>
+  <p>源码注释直接把 <code>Agent</code> 称为 “Stateful wrapper around the low-level agent loop”。它持有 transcript、tools、streaming 状态，以及 steering/follow-up queues；真正的低层调度则交给 <code>runAgentLoop</code>/<code>runAgentLoopContinue</code>。</p>
+
+  <h3>3.3 <code>agent-loop.ts</code>：入口</h3>
+  <pre><code>runAgentLoop(...)
+  ├─ 把新 prompt 加入 currentContext
+  ├─ emit agent_start / turn_start
+  └─ runLoop(...)</code></pre>
+
+  <h3>3.4 <code>runLoop()</code>：真正的循环</h3>
+  <p>当前源码是 outer loop + inner loop。第一课先只关注最核心的 natural continuation：</p>
+  <pre><code>while (true) {                       // outer
+  while (hasMoreToolCalls || pendingMessages.length &gt; 0) {
+    ...
+    assistant = streamAssistantResponse(...)
+    toolCalls = assistant.content.filter(type === "toolCall")
+
+    if (toolCalls.length &gt; 0) {
+      results = executeToolCalls(...)
+      append results to context
+      hasMoreToolCalls = !batch.terminate
+    }
+
+    finishTurn(...)
+    poll steering
+  }
+
+  poll follow-up
+  if (follow-up exists) continue
+
+  if (explicitContinuation) continue
+
+  break
+}</code></pre>
+
+  <h3>3.5 Provider boundary</h3>
+  <p><code>streamAssistantResponse()</code> 在真正调用模型前做两步：</p>
+  <pre><code>AgentMessage[]
+  ↓ transformContext?()
+AgentMessage[]
+  ↓ convertToLlm()
+Message[]
+  ↓ normalizeContext()
+TranscriptContext
+  ↓ streamFunction(model, context)
+AssistantMessage stream</code></pre>
+  <p>这条边界很重要，但为什么要把 provider/model 再拆成 <code>packages/ai</code>，留到 Lesson 02。</p>
+
+  <h3>3.6 Tool branch</h3>
+  <p>assistant message 出现 tool calls 时，Pi 会进入 <code>executeToolCalls()</code>。当前实现支持 parallel/sequential；但无论哪种模式，本课只抓共同语义：</p>
+  <pre><code>assistant toolCall
+  ↓
+arguments validation / preflight
+  ↓
+tool.execute(...)
+  ↓
+finalize result
+  ↓
+ToolResultMessage
+  ↓
+append to currentContext.messages
+  ↓
+下一 turn 的 provider request 可以看到 result</code></pre>
+
+  <h2>4. Execution Trace</h2>
+  <p>假设用户说：</p>
+  <pre><code>“告诉我 config.json 里的 model 是什么。”</code></pre>
+  <p>模型第一次没有直接回答，而是产生：</p>
+  <pre><code>toolCall: read({ path: "config.json" })</code></pre>
+
+  <p>源码级 mental trace：</p>
+  <pre><code>① user message 已进入 context
+
+② streamAssistantResponse()
+   → provider 返回 AssistantMessage(toolCall)
+
+③ runLoop() 取出 toolCalls
+
+④ executeToolCalls(...)
+   → 找到名为 read 的 executable tool
+   → 参数校验
+   → read.execute(...)
+
+⑤ tool execution 得到 result
+   → 转为 ToolResultMessage
+
+⑥ ToolResultMessage append 到 currentContext.messages
+
+⑦ hasMoreToolCalls = true（除非整个 batch 明确 terminate）
+
+⑧ 进入下一 turn
+   → provider request 包含之前 assistant toolCall + tool result
+
+⑨ 模型现在根据文件内容回答：
+   “model 是 ...”
+
+⑩ 如果没有新的 tool call、没有 steering/follow-up，
+   且 finishTurn 没要求 continue
+   → run 结束</code></pre>
+
+  <h2>5. What the video can help with — and where to be careful</h2>
+  <p>上传字幕对“LLM → tool → result → LLM”的直觉有帮助。但课程不会把视频口述中的“模型判断完成就结束”直接当作当前实现。当前源码存在 <code>finishTurn</code>、tool-result continuation、steering/follow-up 等更精确的 scheduling 语义。</p>
+
+  <h2>6. Practice</h2>
+  <p><strong>不要看上面的 execution trace。</strong>给定 assistant 输出：</p>
+  <pre><code>{
+  type: "toolCall",
+  name: "read",
+  arguments: { path: "config.json" }
+}</code></pre>
+  <p>请自己写出从这条 <code>toolCall</code> 到下一次 LLM request 之间至少 5 个步骤，并说明每一步是“模型做的”还是“Agent runtime 做的”。</p>
+
+  <div class="gate">
+    <h2 style="border:0;margin-top:0;padding-top:0">Learning Gate 01</h2>
+    <p>闭卷回答，允许用自己的语言：</p>
+    <ol>
+      <li><strong>Boundary：</strong>为什么 “LLM 调用了 read 工具” 这句话技术上不够精确？</li>
+      <li><strong>Execution：</strong>从 assistant 产生一个合法 toolCall 开始，到模型拿到 tool result 为止，按顺序说出执行链。</li>
+      <li><strong>Termination：</strong>为什么 “Pi 每轮都会问模型 finished 了吗” 不是当前源码的准确描述？至少说出一种自然 continuation 和一种显式控制机制。</li>
+      <li><strong>Transfer：</strong>如果你自己写 mini-Pi，为什么不能只写 <code>while(true) { callLLM() }</code>？你至少还必须维护什么状态/协议？</li>
+    </ol>
+    <p><strong>通过标准：</strong>不是关键词全对，而是能正确区分 model 与 runtime，并能恢复因果顺序。通过后才创建第一条 learning record。</p>
+  </div>
+
+  <h2>7. Primary sources</h2>
+  <ul>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts">Pi · agent-loop.ts</a></li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent.ts">Pi · agent.ts</a></li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/src/types.ts">Pi · types.ts</a></li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/agent/README.md">Pi Agent Core README</a></li>
+    <li><a href="https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/how-pi-works.md">How Pi Works</a></li>
+  </ul>
+
+  <p class="muted">有任何一行源码看不懂，直接把那一行或函数名拿来问。不要为了完成 lesson 跳过不理解的 boundary。</p>
+</body>
+</html>
